@@ -1,0 +1,178 @@
+{
+ "schemaVersion": "1.0",
+ "thresholds": {
+  "high": 80,
+  "low": 60
+ },
+ "projectRoot": "/repo",
+ "framework": {
+  "name": "StrykerJS",
+  "version": "8.7.1"
+ },
+ "files": {
+  "src/a/calc.ts": {
+   "language": "typescript",
+   "source": "export function pick(a: number, b: number) {\n  if (a === b) return 'same';\n  const max = a > b ? a : b;\n  console.log(\"picked | max\");\n  return max;\n}\n",
+   "mutants": [
+    {
+     "id": "0",
+     "mutatorName": "EqualityOperator",
+     "replacement": "a !== b",
+     "location": {
+      "start": {
+       "line": 2,
+       "column": 7
+      },
+      "end": {
+       "line": 2,
+       "column": 14
+      }
+     },
+     "status": "Killed",
+     "killedBy": [
+      "1",
+      "0",
+      "2"
+     ],
+     "coveredBy": [
+      "0",
+      "1",
+      "2"
+     ]
+    },
+    {
+     "id": "1",
+     "mutatorName": "ConditionalExpression",
+     "replacement": "false",
+     "location": {
+      "start": {
+       "line": 2,
+       "column": 7
+      },
+      "end": {
+       "line": 2,
+       "column": 14
+      }
+     },
+     "status": "Killed",
+     "killedBy": [
+      "1"
+     ],
+     "coveredBy": [
+      "1"
+     ]
+    },
+    {
+     "id": "2",
+     "mutatorName": "ConditionalExpression",
+     "replacement": "true",
+     "location": {
+      "start": {
+       "line": 2,
+       "column": 7
+      },
+      "end": {
+       "line": 2,
+       "column": 14
+      }
+     },
+     "status": "Timeout",
+     "coveredBy": [
+      "0"
+     ]
+    },
+    {
+     "id": "3",
+     "mutatorName": "EqualityOperator",
+     "replacement": "a >= b",
+     "location": {
+      "start": {
+       "line": 3,
+       "column": 15
+      },
+      "end": {
+       "line": 3,
+       "column": 20
+      }
+     },
+     "status": "Survived",
+     "coveredBy": [
+      "0",
+      "1",
+      "2"
+     ]
+    },
+    {
+     "id": "4",
+     "mutatorName": "StringLiteral",
+     "replacement": "\"\"",
+     "location": {
+      "start": {
+       "line": 4,
+       "column": 15
+      },
+      "end": {
+       "line": 4,
+       "column": 29
+      }
+     },
+     "status": "NoCoverage"
+    },
+    {
+     "id": "5",
+     "mutatorName": "BlockStatement",
+     "replacement": "{}",
+     "location": {
+      "start": {
+       "line": 1,
+       "column": 45
+      },
+      "end": {
+       "line": 6,
+       "column": 2
+      }
+     },
+     "status": "RuntimeError",
+     "statusReason": "Test runner crashed"
+    }
+   ]
+  }
+ },
+ "testFiles": {
+  "__tests__/calc.test.ts": {
+   "source": "describe(\"pick\", () => {\n  describe(\"with two numbers\", () => {\n    it(\"returns the larger\", () => {});\n    it(\"returns same for equal numbers\", () => {});\n    it(\"handles negatives\", () => {});\n  });\n});\n",
+   "tests": [
+    {
+     "id": "0",
+     "name": "pick with two numbers returns the larger",
+     "location": {
+      "start": {
+       "line": 3,
+       "column": 5
+      }
+     }
+    },
+    {
+     "id": "1",
+     "name": "pick with two numbers returns same for equal numbers",
+     "location": {
+      "start": {
+       "line": 4,
+       "column": 5
+      }
+     }
+    },
+    {
+     "id": "2",
+     "name": "pick with two numbers handles negatives",
+     "location": {
+      "start": {
+       "line": 5,
+       "column": 5
+      }
+     }
+    }
+   ]
+  }
+ }
+}

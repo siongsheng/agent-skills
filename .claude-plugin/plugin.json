@@ -1,0 +1,9 @@
+{
+  "name": "agent-skills",
+  "version": "0.1.0",
+  "description": "Generic Claude Code helpers: a task anchor that survives compaction, a delegation checklist, git command shaping, lint on edit, and a mutation-testing PR section",
+  "license": "MIT",
+  "author": {
+    "name": "siongsheng"
+  }
+}

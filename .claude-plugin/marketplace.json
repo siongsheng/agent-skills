@@ -1,0 +1,16 @@
+{
+  "name": "agent-skills",
+  "owner": {
+    "name": "siongsheng"
+  },
+  "plugins": [
+    {
+      "name": "agent-skills",
+      "source": "./",
+      "description": "Generic Claude Code helpers"
+    }
+  ],
+  "metadata": {
+    "description": "Generic Claude Code helpers from siongsheng"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "a/calc.ts:3:EqualityOperator": "only differs when a equals b, and line 2 returns first then.",
+  "calc.ts:4:StringLiteral": "log text only.",
+  "a/calc.ts:1:BlockStatement": "the tests catch it, but the crash ends the run first."
+}

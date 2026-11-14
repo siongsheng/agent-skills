@@ -1,0 +1,425 @@
+#!/usr/bin/env node
+// mutation-section --report <mutation.json|mutations.xml> [--reasons r.json] [--manual m.json]
+//                  [--tool NAME] [--into body.md]
+//   prints the mutation part of a PR body's ## How it was tested section, built from the report: one
+//   marked bullet with the score, then each table folded in its own <details> block.
+//   --reasons  JSON object: "<file>:<line>:<mutatorName>" or a mutant id from `ids` -> why it is left.
+//              Mutants on one line with the same reason share a row.
+//   --manual   JSON array of {file, line, edit, result: "caught"|"survived", test, why?}
+//   --into     prints that body with its mutation part replaced, or added to ## How it was tested
+// mutation-section ids --report <file> -> each mutant that needs a reason: id, result, mutant
+// Exit 1, with nothing on stdout, when a mutant the tests did not catch has no reason.
+// Exit 2 on a usage error or an input file that cannot be read or parsed.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const RESULT = {
+  survived: '⚠️ Survived',
+  nocov: '⚪ Not covered',
+};
+// Each ⚠️ or ⚪ that starts a cell in a Mutant column marks one mutant the tests did not catch.
+const MARK = { survived: '⚠️', nocov: '⚪' };
+// Statuses that count as caught in the score; every other status needs a reason.
+const CAUGHT = ['killed', 'timeout', 'memory'];
+const SHORT_MAX = 70;
+const ID_HASH_LENGTH = 6;
+const KIND = { RuntimeError: 'crash', RUN_ERROR: 'crash', CompileError: 'compile', NON_VIABLE: 'compile', Ignored: 'ignored' };
+const LEFT_OUT = { crash: '➖ Crashed the run', compile: '➖ Did not compile', ignored: '➖ Switched off', other: '➖ No result' };
+const KIND_TEXT = { crash: 'crashed the run', compile: 'did not compile', ignored: 'switched off', other: 'no result' };
+const resultOf = (m) => RESULT[m.status] || LEFT_OUT[m.kind] || LEFT_OUT.other;
+
+const relSrc = (p) => p.replace(/\\/g, '/').replace(/^(?:.*?\/)?src\/(?:main\/java\/|test\/java\/)?/, '');
+const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
+const short = (s, n = SHORT_MAX) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
+const cell = (s) => String(s).replace(/\r?\n/g, ' ').replace(/\|/g, '\\|');
+
+function code(s) {
+  const t = flat(s);
+  if (!t) return '';
+  const run = Math.max(0, ...[...t.matchAll(/`+/g)].map((m) => m[0].length));
+  const fence = '`'.repeat(run + 1);
+  const pad = run ? ' ' : '';
+  return `${fence}${pad}${t}${pad}${fence}`;
+}
+
+function mutantId(file, line, mutator, extra) {
+  const h = crypto.createHash('sha1').update(extra).digest('hex').slice(0, ID_HASH_LENGTH);
+  return `${file}:${line}:${mutator}:${h}`;
+}
+
+// Jest joins the describe titles and the test title with spaces; split them back on the
+// describe titles the test file declares.
+function testName(name, source) {
+  if (!source) return name;
+  const titles = [...source.matchAll(/\bdescribe(?:\.(?:only|skip))?\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/g)]
+    .map((m) => m[2].replace(/\\(.)/g, '$1'))
+    .filter((t) => t && !/\$\{|%[sdifjop#]/.test(t))
+    .sort((a, b) => b.length - a.length);
+  const parts = [];
+  let rest = name;
+  for (;;) {
+    const t = titles.find((x) => rest.startsWith(`${x} `));
+    if (!t) break;
+    parts.push(t);
+    rest = rest.slice(t.length + 1);
+  }
+  return [...parts, rest].join(' › ');
+}
+
+function span(lines, loc) {
+  const s = loc.start;
+  const e = loc.end || loc.start;
+  if (s.line === e.line) return (lines[s.line - 1] || '').slice(s.column - 1, e.column - 1);
+  const mid = lines.slice(s.line, e.line - 1);
+  return [(lines[s.line - 1] || '').slice(s.column - 1), ...mid, (lines[e.line - 1] || '').slice(0, e.column - 1)].join('\n');
+}
+
+// Binary-operator mutants replace the whole expression; show only the operator that changed.
+const OPERATOR = /^(?:EqualityOperator|LogicalOperator|ArithmeticOperator|AssignmentOperator|UpdateOperator)$/;
+function changed(a, b, mutator) {
+  if (!OPERATOR.test(mutator)) return [a, b];
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  let j = 0;
+  while (j < a.length - i && j < b.length - i && a[a.length - 1 - j] === b[b.length - 1 - j]) j++;
+  const op = (c) => c !== undefined && /[=!<>&|+\-*/%?^~]/.test(c);
+  while (i > 0 && op(a[i - 1])) i--;
+  while (j > 0 && op(a[a.length - j])) j--;
+  const x = a.slice(i, a.length - j).trim();
+  const y = b.slice(i, b.length - j).trim();
+  return x && y ? [x, y] : [a, b];
+}
+
+// The keyword before a block's "{", so an emptied try block and its catch block read apart.
+function opener(before) {
+  const m = /(?:^|[\s;}])(else\s+if|try|catch|finally|else|if)\b[^{}]*$/.exec(before);
+  return m ? m[1].replace(/\s+/g, ' ') : '';
+}
+
+function stryker(r) {
+  const tests = new Map();
+  Object.entries(r.testFiles || {}).forEach(([, f]) => {
+    (f.tests || []).forEach((t) => tests.set(String(t.id), testName(t.name, f.source)));
+  });
+  const mutants = [];
+  Object.entries(r.files || {}).forEach(([p, f]) => {
+    const lines = String(f.source || '').split('\n');
+    const file = relSrc(p);
+    (f.mutants || []).forEach((m, order) => {
+      const loc = m.location;
+      const line = loc.start.line;
+      const orig = flat(span(lines, loc));
+      const [a, b] = changed(orig, flat(m.replacement ?? ''), m.mutatorName);
+      const where = `${loc.start.line}:${loc.start.column}-${loc.end?.line}:${loc.end?.column}|${m.replacement ?? ''}`;
+      mutants.push({
+        file, path: p, line, end: loc.end?.line || line, column: loc.start.column, order,
+        id: mutantId(file, line, m.mutatorName, where),
+        mutator: m.mutatorName,
+        status: ({ Killed: 'killed', Timeout: 'timeout', Survived: 'survived', NoCoverage: 'nocov' })[m.status] || 'error',
+        raw: m.status,
+        kind: KIND[m.status] || 'other',
+        orig,
+        multi: Boolean(loc.end && loc.end.line !== loc.start.line),
+        opener: opener((lines[line - 1] || '').slice(0, loc.start.column - 1)),
+        to: flat(m.replacement ?? ''),
+        mutant: `${code(short(a))} → ${b ? code(short(b)) : 'nothing'}`,
+        by: (m.killedBy || []).map((id) => tests.get(String(id)) || `test ${id}`),
+        note: m.status === 'Ignored' ? m.statusReason || '' : '',
+      });
+    });
+  });
+  return { tool: r.framework?.name || 'StrykerJS', mutants };
+}
+
+const xmlText = (s) => s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&').trim();
+const tag = (body, name) => { const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(body); return m ? xmlText(m[1]) : ''; };
+
+// PIT names a test as "pkg.Class.[engine:junit-jupiter]/[class:pkg.Class]/[nested:pkg.Class$Inner]/[method:name()]",
+// or in the JUnit 4 form "pkg.Class.name(pkg.Class)".
+function pitTest(t) {
+  const parts = [...t.matchAll(/\[(class|nested|method|test-template):([^\]]*)\]/g)];
+  if (parts.length) {
+    return parts.map(([, k, v]) => (k === 'method' || k === 'test-template' ? v.replace(/\(.*\)$/, '') : v.split(/[.$]/).pop())).join(' › ');
+  }
+  const m = /^(.*)\.([^.(]+)\((.*)\)$/.exec(t);
+  return m ? `${m[1].split('.').pop()} › ${m[2]}` : t;
+}
+
+const PIT = { KILLED: 'killed', TIMED_OUT: 'timeout', MEMORY_ERROR: 'memory', SURVIVED: 'survived', NO_COVERAGE: 'nocov' };
+// GitHub drops "<init>" in "java/util/ArrayList::<init>" as an unknown HTML tag.
+const pitDescription = (s) => s.replace(/\S+::\S+/g, (t) => code(t));
+function pit(xml) {
+  const mutants = [...xml.matchAll(/<mutation\b([^>]*)>([\s\S]*?)<\/mutation>/g)].map(([, attrs, body], order) => {
+    const status = (/\bstatus=['"]([A-Z_]+)['"]/.exec(attrs) || [])[1] || '';
+    const cls = tag(body, 'mutatedClass').replace(/\$.*/, '');
+    const file = `${cls.split('.').slice(0, -1).join('/')}${cls.includes('.') ? '/' : ''}${tag(body, 'sourceFile')}`;
+    const line = Number(tag(body, 'lineNumber'));
+    const mutator = tag(body, 'mutator').split('.').pop();
+    const killing = tag(body, 'killingTests') || tag(body, 'killingTest');
+    return {
+      file, path: file, line, column: 0, order,
+      id: mutantId(file, line, mutator, `${tag(body, 'mutatedMethod')}|${tag(body, 'index') || tag(body, 'indexes')}|${tag(body, 'description')}`),
+      mutator,
+      status: PIT[status] || 'error',
+      raw: status,
+      kind: KIND[status] || 'other',
+      orig: '',
+      mutant: pitDescription(tag(body, 'description') || mutator),
+      by: killing ? killing.split('|').filter(Boolean).map(pitTest) : [],
+      note: '',
+    };
+  });
+  return { tool: 'PIT', mutants };
+}
+
+function load(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  return /^\s*</.test(text) ? pit(text) : stryker(JSON.parse(text));
+}
+
+const keyFile = (k) => k.replace(/\\/g, '/');
+function reasonFor(m, reasons) {
+  if (reasons[m.id] !== undefined) return reasons[m.id];
+  const names = new Set([m.file, m.path, path.basename(m.file)]);
+  const hit = Object.keys(reasons).find((k) => {
+    const x = /^(.*):(\d+):([A-Za-z]+)$/.exec(keyFile(k));
+    return x && names.has(x[1]) && Number(x[2]) === m.line && x[3] === m.mutator;
+  });
+  return hit === undefined ? undefined : reasons[hit];
+}
+
+const sorted = (ms) => [...ms].sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.column - b.column || a.order - b.order);
+const upper = (s) => s.replace(/^\s*(\S)/, (c) => c.toUpperCase());
+const sentence = (s) => { const t = upper(flat(s)); return /[.!?]$/.test(t) ? t : `${t}.`; };
+// Two decimals; 1 survivor in 20,001 would round to "100%" and read as all caught, so cap it below 100.
+const PCT_SCALE = 100;
+const PCT_BELOW_FULL = 99.99;
+const pct = (k, m) => { const v = Math.round((k / m) * 100 * PCT_SCALE) / PCT_SCALE; return `${k < m && v >= 100 ? PCT_BELOW_FULL : v}%`; };
+
+// Each file by its shortest path suffix that no other file in the section ends with.
+function labels(files) {
+  const all = [...new Set(files)];
+  return Object.fromEntries(all.map((f) => {
+    const segs = f.split('/');
+    for (let k = 1; k < segs.length; k++) {
+      const suf = segs.slice(-k).join('/');
+      if (all.filter((g) => g === suf || g.endsWith(`/${suf}`)).length === 1) return [f, suf];
+    }
+    return [f, f];
+  }));
+}
+
+function leftOut(errors) {
+  const n = errors.length;
+  const kinds = [...new Set(errors.map((m) => m.kind))];
+  const they = n === 1 ? 'it' : 'they';
+  const why = kinds.length !== 1 ? '' : {
+    crash: ' because the test run crashed',
+    compile: ` because ${they} did not compile`,
+    ignored: ` because ${they} ${n === 1 ? 'was' : 'were'} switched off`,
+  }[kinds[0]] || '';
+  return ` ${n} more ${n === 1 ? 'was' : 'were'} left out of the score${why}.`;
+}
+
+// Rows that share a key become one row, at the place of the first.
+function group(xs, key) {
+  const out = new Map();
+  xs.forEach((x) => {
+    const k = key(x);
+    if (out.has(k)) out.get(k).items.push(x);
+    else out.set(k, { key: k, items: [x] });
+  });
+  return [...out.values()];
+}
+
+// A reason names its kind by its first words: "Gap", "Equivalent" or "Not observable".
+function kinds(whys) {
+  const n = { gap: 0, equivalent: 0, 'not observable': 0, other: 0 };
+  whys.forEach((w) => {
+    if (/^gap\b/i.test(w)) n.gap++;
+    else if (/^equivalent\b/i.test(w)) n.equivalent++;
+    else if (/^not observable\b/i.test(w)) n['not observable']++;
+    else n.other++;
+  });
+  return Object.entries(n).filter(([, k]) => k).map(([name, k]) => name === 'other' ? `${k} with another reason` : `${k} ${name}${name === 'gap' && k > 1 ? 's' : ''}`).join(', ');
+}
+
+const MARKER = '<!-- mutation-section -->';
+
+function render({ tool, mutants }, opt = {}) {
+  const reasons = opt.reasons || {};
+  const manual = opt.manual || [];
+  const caught = sorted(mutants.filter((m) => CAUGHT.includes(m.status)));
+  const left = sorted(mutants.filter((m) => m.status === 'survived' || m.status === 'nocov'));
+  const errors = sorted(mutants.filter((m) => m.status === 'error'));
+  const byManual = sorted(manual.map((x, order) => ({ ...x, file: relSrc(x.file), path: x.file, line: Number(x.line), column: 0, order })));
+  const scored = caught.length + left.length;
+  const files = [...mutants, ...byManual];
+  const label = labels(files.map((x) => x.file));
+  const where = (x) => code(`${label[x.file]}:${x.line}${x.end > x.line ? `-${x.end}` : ''}`);
+  const missing = [];
+  const lines = [];
+  const blocks = [];
+  let out = errors.length ? leftOut(errors) : '';
+  if (tool === 'PIT' && errors.some((m) => m.kind === 'crash')) out += " PIT's own report counts a crash as caught.";
+  const mutantOf = (m) => (m.multi && m.mutator === 'BlockStatement' && m.to === '{}'
+    ? `${m.opener ? `${code(m.opener)} ` : ''}block emptied to \`{}\`` : m.mutant);
+  const named = (s) => (tool === 'StrykerJS' ? String(s).replace(/\bStryker\b/g, 'StrykerJS') : String(s));
+  const reasoned = (m) => {
+    const why = reasonFor(m, reasons);
+    if ((why === undefined || !flat(why)) && !m.note) missing.push(m);
+    return sentence(named(why || m.note || 'No reason given'));
+  };
+  const legend = (pairs) => pairs.filter(([on]) => on).map(([, s]) => s).join(', ');
+  const table = (summary, head, rows) => {
+    if (!rows.length) return;
+    blocks.push(['', `<details><summary>Mutation testing: ${summary}</summary>${MARKER}`, '', `| ${head.join(' | ')} |`, `| ${head.map(() => '---').join(' | ')} |`, ...rows, '', '</details>']);
+  };
+  const reasonRows = (ms, show) => group(ms.map((m) => ({ m, why: reasoned(m) })), ({ m, why }) => `${where(m)}\n${why}`)
+    .map(({ items }) => `| ${where(items[0].m)} | ${items.map(({ m }) => show(m)).join('<br>')} | ${cell(items[0].why)} |`);
+
+  table(`${left.length} not caught`, ['Line', `Mutant (${legend([[left.some((m) => m.status === 'survived'), '⚠️ survived'], [left.some((m) => m.status === 'nocov'), '⚪ no test runs it']])})`, 'Why'],
+    reasonRows(left, (m) => `${MARK[m.status]} ${cell(mutantOf(m))}`));
+  // The score line names the cause only when every left-out mutant has the same one.
+  const mixed = new Set(errors.map((m) => m.kind)).size > 1;
+  table(`${errors.length} left out of the score`, ['Line', 'Mutant (➖ left out of the score)', 'Why'],
+    reasonRows(errors, (m) => `➖ ${cell(mutantOf(m))}${mixed ? ` (${KIND_TEXT[m.kind] || KIND_TEXT.other})` : ''}`));
+  const manualRows = byManual.map((x) => {
+    const ok = String(x.result).toLowerCase() === 'caught';
+    if (!ok && !flat(x.why || '')) missing.push({ id: `manual:${x.path}:${x.line}`, file: x.file, line: x.line, manual: true, mutant: x.edit });
+    const why = ok ? `Fails "${x.test}".${x.why ? ` ${sentence(named(x.why))}` : ''}` : sentence(named(x.why || 'No reason given'));
+    return { ok, text: `| ${where(x)} | ${ok ? '✅' : '⚠️'} ${cell(x.edit)} | ${cell(why)} |` };
+  });
+  table(`${manualRows.length} checked by hand`, ['Line', `Edit by hand, not scored (${legend([[manualRows.some((r) => r.ok), '✅ caught'], [manualRows.some((r) => !r.ok), '⚠️ not caught']])})`, 'Why'],
+    manualRows.map((r) => r.text));
+  const notCaught = left.length ? ` Not caught: ${kinds(left.map((m) => flat(reasonFor(m, reasons) || m.note || '')))}.` : '';
+  const byHand = manualRows.length ? ` Checked by hand: ${manualRows.filter((r) => r.ok).length} of ${manualRows.length} caught.` : '';
+  const clean = scored && !left.length && !errors.length && manualRows.every((r) => r.ok);
+  const score = scored
+    ? `${tool} caught ${caught.length} of ${scored} mutants (${pct(caught.length, scored)}) on this PR's changed lines.`
+    : `${tool} made no scored mutants on this PR's changed lines.`;
+  lines.unshift(`- ${clean ? '✅' : '⚠️'} **Mutation testing:** ${score}${notCaught}${out}${byHand}`, ...blocks.flat());
+  return { text: lines.join('\n'), missing, counts: { caught: caught.length, scored, left: left.length, errors: errors.length } };
+}
+
+const MUTATION = /^\s*(?:[-*]\s+)?(?:(?:✅|⚠️?|❌)\s+)?\*\*Mutation testing:\*\*/;
+// Blocks written before the marker existed match by their exact summary, so a human block is never dropped.
+const OWN = /<!-- mutation-section -->|^<details><summary>(?:Mutation testing: )?\d+ (?:caught|not caught|left out of the score|checked by hand)<\/summary>$/;
+const LEAD_IN = /^\s*[-*]\s+(?:(?:✅|⚠️?|❌)\s+)?\*\*[^*]+:\*\*/;
+
+// Drops every <details> block that mutation-section wrote, so a second run gives the same body.
+function dropOwn(lines) {
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/<details\b/.test(lines[i]) || !OWN.test(lines[i])) { out.push(lines[i]); continue; }
+    let open = 0;
+    for (; i < lines.length; i++) {
+      open += (lines[i].match(/<details\b/g) || []).length - (lines[i].match(/<\/details>/g) || []).length;
+      if (open <= 0) break;
+    }
+    while (out.length && !out[out.length - 1].trim() && !(lines[i + 1] || '').trim()) out.pop();
+  }
+  return out;
+}
+
+// Blank runs inside a code fence belong to the author, so only runs outside a fence collapse.
+const FENCED_OR_BLANKS = /(^ {0,3}(```|~~~)[^\n]*\n[\s\S]*?(?:^ {0,3}\2[^\n]*$|(?![\s\S])))|\n{3,}/gm;
+const tidy = (lines) => lines.join('\n').replace(FENCED_OR_BLANKS, (m, fence) => (fence ? m : '\n\n'));
+
+// The score bullet replaces the old mutation part, which runs from its line to the next heading, the next
+// bold lead-in (even in a tight list) or a <details> block mutation-section did not write. The tables go
+// at the end of that section.
+function splice(body, block) {
+  const [line, ...rest] = block.split('\n');
+  const tables = rest.join('\n').trim();
+  let lines = dropOwn(body.split('\n'));
+  let at = lines.findIndex((l) => MUTATION.test(l));
+  if (at >= 0) {
+    let end = at + 1;
+    for (; end < lines.length; end++) {
+      const l = lines[end];
+      if (/^#{1,6}\s/.test(l) || LEAD_IN.test(l) || (!lines[end - 1].trim() && /^\*\*[^*]+:\*\*/.test(l))) break;
+      if (/<details\b/.test(l)) break;
+    }
+    let last = end - 1;
+    while (last > at && !lines[last].trim()) last--;
+    lines = [...lines.slice(0, at), line, ...lines.slice(last + 1)];
+  } else {
+    let h = lines.findIndex((l) => /^##\s+How it was tested\b/.test(l));
+    if (h < 0) h = lines.findIndex((l) => /^##\s+(?:Verification|Evidence)\b/.test(l));
+    if (h < 0) {
+      lines = [...body.replace(/\s*$/, '').split('\n'), '', '## How it was tested', '', line, ''];
+      at = lines.length - 2;
+    } else {
+      let end = lines.findIndex((l, i) => i > h && /^##\s/.test(l));
+      if (end < 0) end = lines.length;
+      const lint = lines.findIndex((l, i) => i > h && i < end && /\*\*Lint and types:\*\*/.test(l));
+      let last = lint >= 0 ? lint : end - 1;
+      while (lint < 0 && last > h && !lines[last].trim()) last--;
+      lines = [...lines.slice(0, last + 1), ...(lint < 0 ? [''] : []), line, ...lines.slice(last + 1)];
+    }
+    at = lines.findIndex((l) => l === line);
+  }
+  // A bullet next to a paragraph needs a blank line, or the paragraph swallows it.
+  const para = (l) => l !== undefined && l.trim() && !/^\s*[-*]\s/.test(l);
+  if (para(lines[at - 1])) lines.splice(at++, 0, '');
+  if (para(lines[at + 1])) lines.splice(at + 1, 0, '');
+  if (!tables) return tidy(lines);
+  let end = lines.findIndex((l, i) => i > at && /^##\s/.test(l));
+  if (end < 0) end = lines.length;
+  let last = end - 1;
+  while (last > at && !lines[last].trim()) last--;
+  return tidy([...lines.slice(0, last + 1), '', tables, ...(end < lines.length ? [''] : []), ...lines.slice(last + 1)]);
+}
+
+function args(argv) {
+  const o = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) o[a.slice(2)] = argv[++i];
+    else o._.push(a);
+  }
+  return o;
+}
+
+// Exit 2, not 1, for an unreadable input, so it cannot be mistaken for a missing reason.
+const EXIT_BAD_INPUT = 2;
+function readInput(flag, file, read) {
+  try {
+    return read(file);
+  } catch (e) {
+    console.error(`mutation-section: cannot read --${flag} ${file}: ${e.message}`);
+    process.exit(EXIT_BAD_INPUT);
+  }
+}
+
+function main() {
+  const o = args(process.argv.slice(2));
+  if (!o.report) {
+    console.error('usage: mutation-section [ids] --report <mutation.json|mutations.xml> [--reasons r.json] [--manual m.json] [--tool NAME] [--into body.md]');
+    process.exit(EXIT_BAD_INPUT);
+  }
+  const rep = readInput('report', o.report, load);
+  if (o.tool) rep.tool = o.tool;
+  if (o._[0] === 'ids') {
+    sorted(rep.mutants.filter((m) => !CAUGHT.includes(m.status)))
+      .forEach((m) => console.log(`${m.id}\t${resultOf(m)}\t${m.mutant}`));
+    return;
+  }
+  const json = (flag) => (o[flag] ? readInput(flag, o[flag], (f) => JSON.parse(fs.readFileSync(f, 'utf8'))) : undefined);
+  const res = render(rep, { reasons: json('reasons'), manual: json('manual') });
+  if (res.missing.length) {
+    console.error(`mutation-section: ${res.missing.length} mutant(s) with no reason; add each id to the reasons file as "<id>": "<why>", and give each manual: id a "why" in the manual file`);
+    res.missing.forEach((m) => console.error(`  ${m.id}\t${m.manual ? '⚠️ Not caught' : resultOf(m)}\t${m.mutant}`));
+    process.exitCode = 1;
+    return;
+  }
+  const body = o.into ? readInput('into', o.into, (f) => fs.readFileSync(f, 'utf8')) : undefined;
+  process.stdout.write(body !== undefined ? splice(body, res.text) : `${res.text}\n`);
+}
+
+if (require.main === module) main();
+module.exports = { load, stryker, pit, render, splice, testName, pitTest };
