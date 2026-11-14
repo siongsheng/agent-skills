@@ -15,7 +15,7 @@ Claude Code helpers that work in any project, packaged as one plugin.
 
 ```text
 claude plugin marketplace add siongsheng/agent-skills
-claude plugin install agent-skills@agent-skills
+claude plugin install agent-skills@siongsheng-skills
 ```
 
 Requires `bash`, `python3` (hooks parse the hook payload) and, for `bin/mutation-section`, Node 20 or newer.
