@@ -12,7 +12,8 @@ PAYLOAD=$(timeout 2 cat 2>/dev/null)
 . "$(dirname "$0")/lib/resolve-task-file.sh" 2>/dev/null || exit 0
 
 [ -n "$AGENT" ] && exit 0
-[ -n "$SESSION" ] && rm -f "$TASK_STATE_DIR/.$SESSION.edited" "$TASK_STATE_DIR/.$SESSION.nagged" 2>/dev/null
+# Every per-session marker, including ones another hook adds (such as .handoff).
+[ -n "$SESSION" ] && rm -f "$TASK_STATE_DIR/.$SESSION".* 2>/dev/null
 
 [ "$STATE_OWNED" = "yes" ] || exit 0
 [ -f "$STATE" ] || exit 0
