@@ -17,3 +17,14 @@ test('removes every marker of the ending session, and no other session\'s', () =
   assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('.')).sort(), ['.s2.handoff'])
   rmSync(home, { recursive: true, force: true })
 })
+
+test('a session id with a path in it removes nothing', () => {
+  const home = mkdtempSync(join(tmpdir(), 'cleanup-'))
+  const dir = join(home, '.claude', 'task-state')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(home, 'foo.keep'), '')
+  writeFileSync(join(home, 'foo.edited'), '')
+  execFileSync('/bin/sh', [hook], { input: JSON.stringify({ session_id: '/../../foo' }), env: { HOME: home, PATH: process.env.PATH } })
+  assert.deepEqual(readdirSync(home).filter((f) => f.startsWith('foo')).sort(), ['foo.edited', 'foo.keep'])
+  rmSync(home, { recursive: true, force: true })
+})

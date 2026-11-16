@@ -12,7 +12,9 @@ PAYLOAD=$(timeout 2 cat 2>/dev/null)
 . "$(dirname "$0")/lib/resolve-task-file.sh" 2>/dev/null || exit 0
 
 [ -n "$AGENT" ] && exit 0
-# Every per-session marker, including ones another hook adds (such as .handoff).
+# Every per-session marker, including ones another hook adds (such as .handoff). Session ids are
+# UUIDs; any other character could reach a file outside this session's markers, so do nothing.
+case "$SESSION" in *[!A-Za-z0-9_-]*) exit 0 ;; esac
 [ -n "$SESSION" ] && rm -f "$TASK_STATE_DIR/.$SESSION".* 2>/dev/null
 
 [ "$STATE_OWNED" = "yes" ] || exit 0
